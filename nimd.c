@@ -57,3 +57,97 @@ void signal_setup(void) {
 
     sigaction(SIGCHLD, &sa_chld, NULL); // Handle SIGCHLD to reap child processes
 }
+
+// Send message to client
+int send_ngp_message(int fd, const char *type, const char *format, ...) {
+    char buffer[256];
+    char message[128];
+    va_list ap;
+    va_start(ap, format);
+    int n = vsnprintf(buffer, sizeof(buffer), format, ap);
+    va_end(ap);
+    if (n < 0) {
+        return -1; // Encoding error
+    }
+    return send_message(fd, buffer);
+}
+
+// Game information structure
+typedef struct {
+    int fd;
+    char name[MAX_NAME + 1];
+} PlayerInfo;
+
+//Game info message
+void board_info(int *board, char *buf) {
+    sprintf(buf, "BOARD %d %d %d %d %d", board[0], board[1], board[2], board[3], board[4]);
+}
+
+// Check for game over condition
+int check_game_over(int *board) {
+    for (int i = 0; i < NUM_PILES; i++) {
+        if (board[i] > 0) {
+
+            return 0; // Game is not over
+        }
+    }
+    return 1; // Game is over
+}
+
+// Gameplay function
+void play_game(PlayerInfo player1, PlayerInfo player2) {
+    int board[NUM_PILES] = {3, 5, 7, 9, 11}; // Initial board setup
+    int turn = 0; // 0 for player1's turn, 1 for player2's turn
+    int winner = -1; // -1 for no winner, 0 for player1, 1 for player2
+    char board_buf[128];
+
+    // Send player names messages
+    send_ngp_message(player1.fd, "NAME", "1|%s", player1.name);
+    send_ngp_message(player2.fd, "NAME", "2|%s", player2.name);
+
+    while (!is_game_over()) {
+        PlayerInfo current_player = (turn == 0) ? player1 : player2;
+        PlayerInfo other_player = (turn == 0) ? player2 : player1;
+
+        // Send board state to both players
+        board_info(board, board_buf);
+        send_ngp_message(current_player.fd, "PLAY", "%d|%s", turn, board_buf);
+        send_ngp_message(other_player.fd, "PLAY", "%d|%s", turn, board_buf);
+
+        // Receive move from current player
+        char move_buf[128];
+        int n = receive_message(current_player.fd, move_buf, sizeof(move_buf) - 1, 0);
+        if (n <= 0) {
+            winner = (turn == 0) ? 1 : 0; // Other player wins if current player disconnects
+            break;
+        }
+
+        move_buf[n] = '\0';
+
+        int pile, stones;
+        if (sscanf(move_buf, "0|%*2[0-9]|MOVE|%d|%d|", &pile, &stones) != 2 || pile < 1 || pile > NUM_PILES || stones < 1 || stones > board[pile - 1]) {
+            // Invalid move
+            send_ngp_message(current_player.fd, "FAIL", "32 Pile Index or 33 Quantity");
+            continue; // Retry the move
+        }
+
+        //update board state
+        board[pile - 1] -= stones;
+        // Check for game over condition
+        if (check_game_over(board)) {
+            winner = turn; // Current player wins
+            break;
+        }
+
+        turn = (turn == 0) ? 1 : 0; // Switch turns
+    }
+
+    // Send game over message to both players
+    board_info(board, board_buf);
+    send_ngp_message(player1.fd, "OVER", "%d|%s|", winner, board_buf);
+    send_ngp_message(player2.fd, "OVER", "%d|%s|", winner, board_buf);
+
+    close(player1.fd);
+    close(player2.fd);
+}
+    
