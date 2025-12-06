@@ -24,7 +24,7 @@ volatile sig_atomic_t active = 1; // Flag to control server activity
 void log_message(const char *format, ...) {
     va_list ap;
     va_start(ap, format); // Initialize variable argument list
-    vprintf(stdout, format, ap); // Print formatted message to stdout
+    vfprintf(stdout, format, ap); // Print formatted message to stdout
     fprintf(stdout, "\n");
     fflush(stdout);
     va_end(ap); // Clean up variable argument list
@@ -57,4 +57,3 @@ void signal_setup(void) {
 
     sigaction(SIGCHLD, &sa_chld, NULL); // Handle SIGCHLD to reap child processes
 }
-
