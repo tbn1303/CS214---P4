@@ -150,4 +150,85 @@ void play_game(PlayerInfo player1, PlayerInfo player2) {
     close(player1.fd);
     close(player2.fd);
 }
-    
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    const char *port = argv[1];
+    int server_fd = setup_server_socket(port, MAX_QUEUE);
+    if (server_fd < 0) {
+        perror("setup_server_socket");
+        exit(EXIT_FAILURE);
+    }
+
+    log_message("Server started on port %s", port);
+    signal_setup();
+
+    while (active) {
+        struct sockaddr_storage client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue; // Interrupted by signal, retry accept
+            }
+            perror("accept");
+            break;
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(client_fd);
+            continue;
+        } else if (pid == 0) {
+            // Child process
+            close(server_fd);
+
+            PlayerInfo player1, player2;
+            player1.fd = client_fd;
+
+            // Receive player 1 name
+            char name_buf[MAX_NAME + 16];
+            int n = receive_message(player1.fd, name_buf, sizeof(name_buf) - 1, 0);
+            if (n <= 0 || sscanf(name_buf, "0|%*2[0-9]|NAME|%72[^\n]|", player1.name) != 1) {
+                log_message("Failed to receive player 1 name");
+                close(player1.fd);
+                exit(EXIT_FAILURE);
+            }
+
+            log_message("Player 1 connected: %s", player1.name);
+
+            // Wait for player 2 to connect
+            player2.fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+            if (player2.fd < 0) {
+                perror("accept for player 2");
+                close(player1.fd);
+                exit(EXIT_FAILURE);
+            }
+
+            // Receive player 2 name
+            n = receive_message(player2.fd, name_buf, sizeof(name_buf) - 1, 0);
+            if (n <= 0 || sscanf(name_buf, "0|%*2[0-9]|NAME|%72[^\n]|", player2.name) != 1) {
+                log_message("Failed to receive player 2 name");
+                close(player1.fd);
+                close(player2.fd);
+                exit(EXIT_FAILURE);
+            }
+            log_message("Player 2 connected: %s", player2.name);
+            // Start the game
+            play_game(player1, player2);
+            exit(EXIT_SUCCESS);
+        } else {
+            // Parent process
+            close(client_fd); // Close client socket in parent
+        }
+    }
+    close(server_fd);
+    log_message("Server shutting down");
+
+    return 0;
+}
