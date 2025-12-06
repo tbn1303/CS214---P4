@@ -163,4 +163,34 @@ int main(int argc, char *argv[]) {
         logmsg("Server listening on port %s", argv[1]);
         exit(EXIT_FAILURE);
     }
+
+    PlayerInfo players[2];
+    int player_count = 0;
+
+    while (active)
+    {
+        struct sockaddr_storage client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                perror("accept");
+                continue; // Interrupted by signal, retry accept
+            }
+        }
+
+        // Receive message type
+        char type_buf[16];
+        int n = receive_message(client_fd, type_buf, sizeof(type_buf) - 1);
+        if (n <= 0) {
+            close(client_fd);
+            continue; // Error or client disconnected
+        }
+        type_buf[n] = '\0';
+
+        // Receive player name
+        char name_buf[MAX_NAME + 1];
+        int n = receive_message(client_fd, name_buf, sizeof(name_buf) - 1
+    }
+    
 }
