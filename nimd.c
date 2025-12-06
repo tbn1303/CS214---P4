@@ -16,17 +16,15 @@
 #include <poll.h>
 #include "network.h"
 
-/* Keep your names and constants */
 #define MAX_QUEUE 8
 #define MAX_NAME 72
 #define NUM_PILES 5
-#define MAX_PAYLOAD 104   /* per project */
+#define MAX_PAYLOAD 104
 #define MAX_MSG (5 + MAX_PAYLOAD)
 
-volatile sig_atomic_t active = 1; /* server keeps running while active != 0 */
+volatile sig_atomic_t active = 1;
 
-/* ---------- Data structures ---------- */
-
+/* ---- Data structures ---- */
 typedef struct client_node {
     int fd;
     char name[MAX_NAME + 1];
@@ -55,100 +53,50 @@ static client_node_t *wait_head = NULL, *wait_tail = NULL;
 static name_node_t *connected_names = NULL; /* waiting + playing */
 static game_entry_t *games = NULL;
 static int listener_fd = -1;
+static int spipe[2] = {-1, -1}; /* self-pipe for SIGCHLD */
 
-/* Self-pipe for SIGCHLD notifications */
-static int spipe[2] = {-1, -1};
-
-/* ---------- Logging (keeps your function name) ---------- */
-
-void log_message(const char *format, ...)
+/* ---- Logging (keep your name) ---- */
+void log_message(const char *fmt, ...)
 {
     va_list ap;
-    va_start(ap, format);
-    vfprintf(stdout, format, ap);
-    fprintf(stdout, "\n");
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    printf("\n");
     fflush(stdout);
     va_end(ap);
 }
 
-/* ---------- Signal handling (keep your names) ---------- */
-
-void handle_signal(int sig) {
+/* ---- Signal handlers ---- */
+void handle_signal(int sig)
+{
     (void)sig;
     active = 0;
 }
 
-/* Reap children (called in main when notified via self-pipe) */
-void reap_children(int sig) {
-    (void)sig;
-    /* write a byte to pipe in signal handler — here we install handler that writes; see below */
-    /* This function is not used as signal handler here (we use a minimal handler that writes). */
-}
-
-/* Setup signal handlers (keeps your name signal_setup) */
-void signal_setup(void)
+/* SIGCHLD handler writes a byte into spipe[1] (async-signal-safe) */
+static void _sigchld_pipe_write(int signo)
 {
-    /* Create self-pipe for SIGCHLD notifications */
-    if (pipe(spipe) < 0) {
-        perror("pipe");
-        exit(EXIT_FAILURE);
-    }
-
-    /* Handler for SIGCHLD -> write a byte to spipe[1] */
-    struct sigaction sa_chld;
-    memset(&sa_chld, 0, sizeof(sa_chld));
-    sa_chld.sa_handler = /* inline handler */ (void(*)(int)) ( + (void*)0 );
-    /* We can't assign an inline lambda in C; instead install a small function below. */
-    /* We'll set handler with sigaction after defining a small function. */
-    /* Install simple handlers for termination signals to set active = 0 */
-    struct sigaction sa_term;
-    memset(&sa_term, 0, sizeof(sa_term));
-    sa_term.sa_handler = handle_signal;
-    sigemptyset(&sa_term.sa_mask);
-    sa_term.sa_flags = 0;
-    if (sigaction(SIGINT, &sa_term, NULL) < 0) { perror("sigaction SIGINT"); exit(EXIT_FAILURE); }
-    if (sigaction(SIGTERM, &sa_term, NULL) < 0) { perror("sigaction SIGTERM"); exit(EXIT_FAILURE); }
-    if (sigaction(SIGHUP, &sa_term, NULL) < 0) { perror("sigaction SIGHUP"); exit(EXIT_FAILURE); }
-
-    /* SIGPIPE ignore so writing to closed socket doesn't kill process */
-    signal(SIGPIPE, SIG_IGN);
-
-    /* Now install SIGCHLD handler that writes to pipe (async-signal-safe) */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = [](int signo) {
-        (void)signo;
-        uint8_t b = 1;
-        /* best-effort write; ignore errors */
-        if (spipe[1] != -1) write(spipe[1], &b, 1);
-    };
-    /* The above lambda-like assignment is not valid in C standard. We'll implement proper handler instead below. */
-    /* Because standard C doesn't support closures, we'll implement a static function for SIGCHLD and set it. */
-}
-
-/* Since C doesn't have lambdas, define the SIGCHLD handler function here: */
-static void _sigchld_pipe_write(int signo) {
     (void)signo;
     uint8_t b = 1;
     if (spipe[1] != -1) {
+        /* best-effort write */
         ssize_t r = write(spipe[1], &b, 1);
         (void)r;
     }
 }
 
-/* Reap children and clean up connected_names for ended games */
+/* Called in main when spipe indicates SIGCHLDs; reap and cleanup */
 static void process_sigchld_events(void)
 {
-    /* Drain the pipe */
     uint8_t buf[64];
-    while (read(spipe[0], buf, sizeof(buf)) > 0) { /* drain */ }
+    /* drain pipe */
+    while (read(spipe[0], buf, sizeof(buf)) > 0) { /* nothing */ }
 
-    /* Reap children and remove their game entries and connected names */
     pid_t pid;
     while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
-        char p1[MAX_NAME + 1] = {0}, p2[MAX_NAME + 1] = {0};
-        /* remove game entry and get p1/p2 */
+        /* remove game entry and connected names */
         game_entry_t **pp = &games;
+        char p1[MAX_NAME+1] = {0}, p2[MAX_NAME+1] = {0};
         while (*pp) {
             if ((*pp)->pid == pid) {
                 game_entry_t *tmp = *pp;
@@ -161,8 +109,8 @@ static void process_sigchld_events(void)
             pp = &(*pp)->next;
         }
         if (p1[0]) {
-            log_message("Child %d ended; removing names '%s' and '%s'", pid, p1, p2);
-            /* remove connected names */
+            log_message("Reaped child %d; removing names '%s' and '%s'", pid, p1, p2);
+            /* remove p1 */
             name_node_t **np = &connected_names;
             while (*np) {
                 if (strcmp((*np)->name, p1) == 0) {
@@ -173,6 +121,7 @@ static void process_sigchld_events(void)
                 }
                 np = &(*np)->next;
             }
+            /* remove p2 */
             np = &connected_names;
             while (*np) {
                 if (strcmp((*np)->name, p2) == 0) {
@@ -184,12 +133,12 @@ static void process_sigchld_events(void)
                 np = &(*np)->next;
             }
         } else {
-            log_message("Child %d ended (no game entry)", pid);
+            log_message("Reaped child %d (no game entry)", pid);
         }
     }
 }
 
-/* ---------- NGP framing helpers ---------- */
+/* ---- NGP framing helpers ---- */
 
 /* read exactly n bytes or return <=0 on error/EOF */
 static ssize_t read_exact(int fd, void *buf, size_t n)
@@ -203,23 +152,20 @@ static ssize_t read_exact(int fd, void *buf, size_t n)
             if (errno == EINTR) continue;
             return -1;
         }
-        got += (size_t) r;
+        got += (size_t)r;
     }
-    return (ssize_t) got;
+    return (ssize_t)got;
 }
 
-/* read NGP payload; returns malloc'd payload string (must free) or NULL.
-   Sends FAIL|10 Invalid| if framing error. */
+/* read NGP payload; returns malloc'd payload (must free), or NULL on error.
+   Sends FAIL|10 Invalid| on framing error. */
 static char *read_ngp_payload(int fd)
 {
     char header[5];
     if (read_exact(fd, header, 5) <= 0) return NULL;
     if (!(header[0] == '0' && header[1] == '|' && isdigit((unsigned char)header[2]) &&
           isdigit((unsigned char)header[3]) && header[4] == '|')) {
-        /* invalid header */
-        /* send FAIL and close */
         const char *fail = "FAIL|10 Invalid|";
-        /* Build full message */
         char hbuf[8];
         snprintf(hbuf, sizeof(hbuf), "0|%02zu|", strlen(fail));
         write(fd, hbuf, strlen(hbuf));
@@ -251,8 +197,8 @@ static char *read_ngp_payload(int fd)
     return payload;
 }
 
-/* split payload "TYPE|f1|f2|...|" into array of pointers (malloc'd)
-   sets out_count, caller must free both array and buffer */
+/* split payload "TYPE|f1|f2|...|" into array of pointers (malloc'd),
+   sets out_count; caller must free both array and buffer */
 static char **split_payload(char *payload, int *out_count)
 {
     int pipes = 0;
@@ -273,7 +219,7 @@ static char **split_payload(char *payload, int *out_count)
     return arr;
 }
 
-/* Build and send an NGP message given payload (payload must include trailing '|') */
+/* Build and send NGP message given payload string (payload must include trailing '|') */
 static ssize_t send_ngp_payload(int fd, const char *payload)
 {
     size_t payload_len = strlen(payload);
@@ -291,27 +237,24 @@ static ssize_t send_ngp_payload(int fd, const char *payload)
     return w;
 }
 
-/* Wrapper keeping name send_ngp_message; format string forms the payload fields (not including TYPE) */
+/* Wrapper: send_ngp_message(fd, "TYPE", "f1|f2") -> builds "TYPE|f1|f2|" then sends */
 int send_ngp_message(int fd, const char *type, const char *format, ...)
 {
-    char payload[MAX_PAYLOAD + 1];
+    char payload[MAX_PAYLOAD+1];
     if (!format || format[0] == '\0') {
-        /* payload is TYPE| (no fields) */
         snprintf(payload, sizeof(payload), "%s|", type);
     } else {
         va_list ap;
         va_start(ap, format);
-        char fields[MAX_PAYLOAD + 1];
+        char fields[MAX_PAYLOAD+1];
         vsnprintf(fields, sizeof(fields), format, ap);
         va_end(ap);
-        /* Build payload: TYPE|fields|  */
         snprintf(payload, sizeof(payload), "%s|%s|", type, fields);
     }
     return (send_ngp_payload(fd, payload) > 0) ? 1 : 0;
 }
 
-/* ---------- Helpers for connected names and wait queue (keep small code) ---------- */
-
+/* ---- Queue & name list helpers ---- */
 static void enqueue_client(client_node_t *c)
 {
     c->next = NULL;
@@ -361,63 +304,52 @@ static void remove_connected_name(const char *name)
     }
 }
 
-/* Add game entry mapping pid -> p1/p2 */
 static void add_game_entry(pid_t pid, const char *p1, const char *p2)
 {
     game_entry_t *e = malloc(sizeof(game_entry_t));
     if (!e) return;
     e->pid = pid;
-    strncpy(e->p1, p1, MAX_NAME);
-    e->p1[MAX_NAME] = '\0';
-    strncpy(e->p2, p2, MAX_NAME);
-    e->p2[MAX_NAME] = '\0';
-    e->next = games;
-    games = e;
+    strncpy(e->p1, p1, MAX_NAME); e->p1[MAX_NAME] = '\0';
+    strncpy(e->p2, p2, MAX_NAME); e->p2[MAX_NAME] = '\0';
+    e->next = games; games = e;
 }
 
-/* ---------- Game helpers (keeping your names) ---------- */
-
-/* keep your board_info name: produce a board string like "1 3 5 7 9" */
+/* ---- Game helpers (keep your names) ---- */
 void board_info(int *board, char *buf)
 {
     snprintf(buf, 128, "%d %d %d %d %d",
              board[0], board[1], board[2], board[3], board[4]);
 }
 
-/* keep your check_game_over name: returns 1 when no stones remain */
 int check_game_over(int *board)
 {
-    for (int i = 0; i < NUM_PILES; ++i) {
-        if (board[i] > 0) return 0;
-    }
+    for (int i = 0; i < NUM_PILES; ++i) if (board[i] > 0) return 0;
     return 1;
 }
 
-/* Validate printable ASCII name, no '|' and length <= MAX_NAME */
 static int valid_name_chars(const char *s)
 {
     if (!s) return 0;
     size_t L = strlen(s);
     if (L == 0 || L > MAX_NAME) return 0;
     for (size_t i = 0; i < L; ++i) {
-        unsigned char c = (unsigned char) s[i];
+        unsigned char c = (unsigned char)s[i];
         if (c < 32 || c > 126 || c == '|') return 0;
     }
     return 1;
 }
 
-/* Child: run the game between two PlayerInfo (child owns the client_node memory) */
+/* ---- Child: play a game between two players ---- */
 void play_game(PlayerInfo player1, PlayerInfo player2)
 {
-    /* Child should close listener_fd if inherited */
     if (listener_fd != -1) close(listener_fd);
 
-    int board[NUM_PILES] = {1, 3, 5, 7, 9}; /* required start */
+    int board[NUM_PILES] = {1, 3, 5, 7, 9};
     int turn = 0; /* 0 -> player1, 1 -> player2 */
     int winner = -1;
     char board_buf[128];
 
-    /* Send NAME messages to both (NAME|playernum|opponent|) */
+    /* Send NAME messages */
     send_ngp_message(player1.fd, "NAME", "1|%s", player2.name);
     send_ngp_message(player2.fd, "NAME", "2|%s", player1.name);
 
@@ -426,11 +358,10 @@ void play_game(PlayerInfo player1, PlayerInfo player2)
         PlayerInfo *opp = (turn == 0) ? &player2 : &player1;
 
         board_info(board, board_buf);
-        /* PLAY|<next player number>|<board>| */
         send_ngp_message(player1.fd, "PLAY", "%d|%s", turn + 1, board_buf);
         send_ngp_message(player2.fd, "PLAY", "%d|%s", turn + 1, board_buf);
 
-        /* Use poll to wait for activity on either socket (but we enforce turn order) */
+        /* poll both sockets */
         struct pollfd pfds[2];
         pfds[0].fd = player1.fd; pfds[0].events = POLLIN;
         pfds[1].fd = player2.fd; pfds[1].events = POLLIN;
@@ -439,7 +370,7 @@ void play_game(PlayerInfo player1, PlayerInfo player2)
             rc = poll(pfds, 2, -1);
             if (rc < 0) {
                 if (errno == EINTR) continue;
-                winner = (turn == 0) ? 1 : 0; /* other wins on fatal error */
+                winner = (turn == 0) ? 1 : 0;
                 break;
             }
             if (rc == 0) continue;
@@ -447,22 +378,19 @@ void play_game(PlayerInfo player1, PlayerInfo player2)
         }
         if (rc < 0) break;
 
-        /* Determine mover fd */
         int mover_fd = -1;
         if (pfds[0].revents & POLLIN) mover_fd = player1.fd;
         else if (pfds[1].revents & POLLIN) mover_fd = player2.fd;
         else { winner = (turn == 0) ? 1 : 0; break; }
 
-        /* If mover is not the player whose turn it is, send FAIL 31 Impatient */
+        /* enforce turn */
         if ((turn == 0 && mover_fd != player1.fd) || (turn == 1 && mover_fd != player2.fd)) {
             send_ngp_message(mover_fd, "FAIL", "31 Impatient");
-            /* do not change turn; continue waiting for correct player's move */
             continue;
         }
 
-        /* Read full payload from mover */
         char *payload = read_ngp_payload(mover_fd);
-        if (!payload) { /* read error or framing error; opponent wins */ winner = (turn==0)?1:0; break; }
+        if (!payload) { winner = (turn==0)?1:0; break; }
 
         int fldc = 0;
         char **flds = split_payload(payload, &fldc);
@@ -472,8 +400,7 @@ void play_game(PlayerInfo player1, PlayerInfo player2)
             winner = (turn==0)?1:0; break;
         }
 
-        char *type = flds[0];
-        if (strcmp(type, "MOVE") != 0) {
+        if (strcmp(flds[0], "MOVE") != 0) {
             send_ngp_message(mover_fd, "FAIL", "24 Not Playing");
             free(payload); free(flds);
             winner = (turn==0)?1:0; break;
@@ -504,25 +431,20 @@ void play_game(PlayerInfo player1, PlayerInfo player2)
 
         if (check_game_over(board)) { winner = turn; break; }
         turn = 1 - turn;
-    } /* end game loop */
+    }
 
-    /* Send OVER|winner+1|board|| (third field empty) */
     board_info(board, board_buf);
     send_ngp_message(player1.fd, "OVER", "%d|%s|", (winner>=0)?(winner+1):0, board_buf);
     send_ngp_message(player2.fd, "OVER", "%d|%s|", (winner>=0)?(winner+1):0, board_buf);
 
     close(player1.fd);
     close(player2.fd);
-
-    /* Child cleanup: exit */
     _exit(EXIT_SUCCESS);
 }
 
-/* ---------- Parent: handle single connection, handshake, and enqueue ---------- */
-
+/* ---- Parent: handle new connection ---- */
 static void handle_new_connection(int client_fd)
 {
-    /* Read OPEN payload */
     char *payload = read_ngp_payload(client_fd);
     if (!payload) { close(client_fd); return; }
 
@@ -550,7 +472,7 @@ static void handle_new_connection(int client_fd)
         close(client_fd); return;
     }
 
-    /* Accept: send WAIT and enqueue */
+    /* Accept: send WAIT, add to connected names, enqueue */
     send_ngp_message(client_fd, "WAIT", "");
     add_connected_name(name);
 
@@ -563,10 +485,9 @@ static void handle_new_connection(int client_fd)
     enqueue_client(c);
     log_message("Enqueued player '%s'", c->name);
 
-    free(payload);
-    free(flds);
+    free(payload); free(flds);
 
-    /* Try to pair two clients */
+    /* Try to form a pair */
     client_node_t *p1 = dequeue_client();
     client_node_t *p2 = dequeue_client();
     if (!p1 || !p2) {
@@ -575,7 +496,6 @@ static void handle_new_connection(int client_fd)
         return;
     }
 
-    /* fork child to run game */
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
@@ -584,7 +504,6 @@ static void handle_new_connection(int client_fd)
         free(p1); free(p2);
         return;
     } else if (pid == 0) {
-        /* Child uses PlayerInfo struct */
         PlayerInfo pl1, pl2;
         pl1.fd = p1->fd; strncpy(pl1.name, p1->name, MAX_NAME);
         pl2.fd = p2->fd; strncpy(pl2.name, p2->name, MAX_NAME);
@@ -592,7 +511,6 @@ static void handle_new_connection(int client_fd)
         play_game(pl1, pl2);
         /* never returns */
     } else {
-        /* parent records mapping and closes fds */
         add_game_entry(pid, p1->name, p2->name);
         log_message("Started game pid=%d: %s vs %s", pid, p1->name, p2->name);
         close(p1->fd); close(p2->fd);
@@ -600,8 +518,7 @@ static void handle_new_connection(int client_fd)
     }
 }
 
-/* ---------- main ---------- */
-
+/* ---- main ---- */
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -609,8 +526,10 @@ int main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    /* create self-pipe and install SIGCHLD handler */
+    /* create self-pipe */
     if (pipe(spipe) < 0) { perror("pipe"); exit(EXIT_FAILURE); }
+
+    /* install SIGCHLD handler that writes to pipe */
     struct sigaction sa_ch;
     memset(&sa_ch, 0, sizeof(sa_ch));
     sa_ch.sa_handler = _sigchld_pipe_write;
@@ -618,7 +537,7 @@ int main(int argc, char **argv)
     sa_ch.sa_flags = SA_RESTART;
     if (sigaction(SIGCHLD, &sa_ch, NULL) < 0) { perror("sigaction SIGCHLD"); exit(EXIT_FAILURE); }
 
-    /* setup handlers for shutdown signals */
+    /* install termination handlers */
     struct sigaction sa_term;
     memset(&sa_term, 0, sizeof(sa_term));
     sa_term.sa_handler = handle_signal;
@@ -635,7 +554,7 @@ int main(int argc, char **argv)
     if (listener_fd < 0) { fprintf(stderr, "open_listener failed\n"); exit(EXIT_FAILURE); }
     log_message("Server listening on port %s", argv[1]);
 
-    /* Use poll to watch listener and spipe[0] */
+    /* poll on listener and self-pipe */
     struct pollfd pfds[2];
     pfds[0].fd = listener_fd; pfds[0].events = POLLIN;
     pfds[1].fd = spipe[0]; pfds[1].events = POLLIN;
@@ -647,9 +566,7 @@ int main(int argc, char **argv)
             perror("poll");
             break;
         }
-        if (pfds[1].revents & POLLIN) {
-            process_sigchld_events();
-        }
+        if (pfds[1].revents & POLLIN) process_sigchld_events();
         if (pfds[0].revents & POLLIN) {
             int client_fd = accept(listener_fd, NULL, NULL);
             if (client_fd < 0) {
@@ -679,6 +596,7 @@ int main(int argc, char **argv)
         connected_names = n->next;
         free(n);
     }
+    /* cleanup games */
     while (games) {
         game_entry_t *g = games;
         games = g->next;
