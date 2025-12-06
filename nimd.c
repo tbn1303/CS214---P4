@@ -190,11 +190,48 @@ int main(int argc, char *argv[]) {
 
         // Receive player name
         char name_buf[MAX_NAME + 1];
+        if(sscanf(type_buf, "0|%*2[0-9]|NAME|%72[^\n]|", name_buf) != 1) {
+            send_ngp(client_fd, "FAIL", "10 Invalid");
+            close(client_fd);
+            continue;
+        }
+
         int n = receive_message(client_fd, name_buf, sizeof(name_buf) - 1);
         if (n <= 0) {
             close(client_fd);
             continue; // Error or client disconnected
         }
+
+        strncpy(players[player_count].name, name_buf, MAX_NAME);
+        players[player_count].fd = client_fd;
+        send_ngp_message(client_fd, "WAIT", "");
+        player_count++;
+        if (player_count == 2) {
+            pid_t pid = fork();
+            if (pid < 0) {
+                log_message("Fork failed");
+                close(players[0].fd);
+                close(players[1].fd);
+            } 
+            
+            else if (pid == 0) {
+                // Child process
+                close(server_fd);
+                play_game(players[0], players[1]);
+                exit(EXIT_SUCCESS);
+            } 
+            
+            else {
+                // Parent process
+                close(players[0].fd);
+                close(players[1].fd);
+            }
+
+            player_count = 0; // Reset for next game
+        }
     }
     
+    logmsg("Shutting down server");
+    close(server_fd);
+    return EXIT_SUCCESS;
 }
