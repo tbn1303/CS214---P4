@@ -190,7 +190,11 @@ int main(int argc, char *argv[]) {
 
         // Receive player name
         char name_buf[MAX_NAME + 1];
-        int n = receive_message(client_fd, name_buf, sizeof(name_buf) - 1
+        int n = receive_message(client_fd, name_buf, sizeof(name_buf) - 1);
+        if (n <= 0) {
+            close(client_fd);
+            continue; // Error or client disconnected
+        }
     }
     
 }
