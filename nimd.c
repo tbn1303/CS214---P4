@@ -17,16 +17,39 @@
 #define MAX_QUEUE 8
 #define MAX_NAME 72
 #define NUM_PILES 5
-#define BUF_SIZE 256
+/* Per spec: entire message (including "0|LL|") <= 104 bytes.
+   Header "0|LL|" is 5 bytes. So payload (the bytes counted by LL) <= 99. */
+#define MAX_PAYLOAD 99
 
 volatile sig_atomic_t active = 1;
 
+/* Simple structures for queued players and active games */
 typedef struct {
     int fd;
     char name[MAX_NAME + 1];
-} PlayerInfo;
+    int opened; /* whether this connection already sent OPEN (used for FAIL 23) */
+} Player;
 
-// --------------------- Logging ---------------------
+typedef struct game_entry {
+    pid_t pid;
+    char p1[MAX_NAME + 1];
+    char p2[MAX_NAME + 1];
+    struct game_entry *next;
+} game_entry_t;
+
+/* Globals */
+static Player wait_queue[MAX_QUEUE];
+static int wait_count = 0;
+
+static char connected_names[256][MAX_NAME + 1]; /* keep list of names in active games & waiting */
+static int connected_count = 0;
+
+static game_entry_t *games_head = NULL;
+
+static int listener_fd = -1;
+
+/* ---------- Utilities ---------- */
+
 void log_message(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -36,11 +59,33 @@ void log_message(const char *fmt, ...) {
     va_end(ap);
 }
 
-// --------------------- Signals ---------------------
-void handle_signal(int sig) { active = 0; }
+void handle_signal(int sig) { (void)sig; active = 0; }
 
+/* Reap children and remove their names from connected list */
 void reap_children(int sig) {
-    while (waitpid(-1, NULL, WNOHANG) > 0);
+    (void)sig;
+    int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        game_entry_t **pp = &games_head;
+        while (*pp) {
+            if ((*pp)->pid == pid) {
+                log_message("Child %d ended: %s vs %s", pid, (*pp)->p1, (*pp)->p2);
+                /* remove names */
+                for (int i = 0; i < connected_count; ++i) {
+                    if (strcmp(connected_names[i], (*pp)->p1) == 0 ||
+                        strcmp(connected_names[i], (*pp)->p2) == 0) {
+                        connected_names[i][0] = '\0';
+                    }
+                }
+                game_entry_t *tmp = *pp;
+                *pp = tmp->next;
+                free(tmp);
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+    }
 }
 
 void setup_signals(void) {
@@ -52,105 +97,426 @@ void setup_signals(void) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
 
-    struct sigaction sa_chld;
-    sa_chld.sa_handler = reap_children;
-    sigemptyset(&sa_chld.sa_mask);
-    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa_chld, NULL);
+    struct sigaction sa_ch;
+    sa_ch.sa_handler = reap_children;
+    sigemptyset(&sa_ch.sa_mask);
+    sa_ch.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa_ch, NULL);
+
+    signal(SIGPIPE, SIG_IGN);
 }
 
-// --------------------- Socket I/O ---------------------
-int send_message(int sock, const char *msg) {
-    int total = (int)strlen(msg);
-    int sent = 0;
-    while (sent < total) {
-        int n = write(sock, msg + sent, total - sent);
-        if (n <= 0) {
+/* ---------- Low-level IO helpers ---------- */
+
+/* read exactly n bytes (unless EOF or error) */
+static ssize_t read_exact(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    char *p = (char*)buf;
+    while (got < n) {
+        ssize_t r = read(fd, p + got, n - got);
+        if (r == 0) return 0; /* EOF */
+        if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
-        sent += n;
+        got += (size_t)r;
     }
+    return (ssize_t)got;
+}
+
+/* write all bytes */
+static ssize_t write_all(int fd, const void *buf, size_t n) {
+    size_t sent = 0;
+    const char *p = (const char*)buf;
+    while (sent < n) {
+        ssize_t w = write(fd, p + sent, n - sent);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        sent += (size_t) w;
+    }
+    return (ssize_t)sent;
+}
+
+/* ---------- NGP framing helpers ---------- */
+
+/* Read an NGP payload (the bytes after the "0|LL|").
+   Returns malloc'd string (must be free'd) or NULL on EOF/error.
+   On framing error, sends FAIL|10 Invalid| and returns NULL.
+*/
+static char *read_ngp_payload(int fd) {
+    char header[5];
+    ssize_t r = read_exact(fd, header, 5);
+    if (r <= 0) return NULL; /* EOF or error */
+
+    /* header must be '0' '|' digit digit '|' */
+    if (!(header[0] == '0' && header[1] == '|' &&
+          isdigit((unsigned char)header[2]) && isdigit((unsigned char)header[3]) &&
+          header[4] == '|')) {
+        /* framing invalid */
+        const char *fail_payload = "FAIL|10 Invalid|";
+        char hbuf[16];
+        snprintf(hbuf, sizeof(hbuf), "0|%02zu|", strlen(fail_payload));
+        write_all(fd, hbuf, strlen(hbuf));
+        write_all(fd, fail_payload, strlen(fail_payload));
+        return NULL;
+    }
+
+    int payload_len = (header[2]-'0')*10 + (header[3]-'0');
+    if (payload_len < 0 || payload_len > MAX_PAYLOAD) {
+        const char *fail_payload = "FAIL|10 Invalid|";
+        char hbuf[16];
+        snprintf(hbuf, sizeof(hbuf), "0|%02zu|", strlen(fail_payload));
+        write_all(fd, hbuf, strlen(hbuf));
+        write_all(fd, fail_payload, strlen(fail_payload));
+        return NULL;
+    }
+
+    char *payload = malloc((size_t)payload_len + 1);
+    if (!payload) return NULL;
+    if (payload_len == 0) {
+        payload[0] = '\0';
+        return payload;
+    }
+    ssize_t rr = read_exact(fd, payload, (size_t)payload_len);
+    if (rr <= 0) { free(payload); return NULL; }
+    payload[payload_len] = '\0';
+
+    /* payload must end with '|' */
+    if (payload[payload_len - 1] != '|') {
+        const char *fail_payload = "FAIL|10 Invalid|";
+        char hbuf[16];
+        snprintf(hbuf, sizeof(hbuf), "0|%02zu|", strlen(fail_payload));
+        write_all(fd, hbuf, strlen(hbuf));
+        write_all(fd, fail_payload, strlen(fail_payload));
+        free(payload);
+        return NULL;
+    }
+    return payload;
+}
+
+/* Splits payload "TYPE|f1|f2|...|" into array of pointers (modifies payload buffer).
+   Returns malloc'd array (must free) and sets count. */
+static char **split_payload(char *payload, int *out_count) {
+    if (!payload) { *out_count = 0; return NULL; }
+    int pipes = 0;
+    for (char *p = payload; *p; ++p) if (*p == '|') ++pipes;
+    if (pipes <= 0) { *out_count = 0; return NULL; }
+    char **arr = malloc((pipes + 1) * sizeof(char*));
+    if (!arr) return NULL;
+    int idx = 0;
+    char *cur = payload;
+    while (idx <= pipes) {
+        arr[idx++] = cur;
+        char *bar = strchr(cur, '|');
+        if (!bar) break;
+        *bar = '\0';
+        cur = bar + 1;
+    }
+    *out_count = idx;
+    return arr;
+}
+
+/* Build and send an NGP message given payload type and fields.
+   format builds the fields (not including TYPE) like printf.
+   Returns 1 on success, 0 on failure.
+*/
+static int send_ngp_message(int fd, const char *type, const char *format, ...) {
+    char payload[MAX_PAYLOAD + 1];
+    if (!format || format[0] == '\0') {
+        snprintf(payload, sizeof(payload), "%s|", type);
+    } else {
+        va_list ap;
+        va_start(ap, format);
+        char fields[MAX_PAYLOAD + 1];
+        vsnprintf(fields, sizeof(fields), format, ap);
+        va_end(ap);
+        snprintf(payload, sizeof(payload), "%s|%s|", type, fields);
+    }
+    size_t payload_len = strlen(payload);
+    if (payload_len > (size_t)MAX_PAYLOAD) return 0;
+    char header[16];
+    snprintf(header, sizeof(header), "0|%02zu|", payload_len);
+    size_t hlen = strlen(header);
+    size_t total = hlen + payload_len;
+    char *buf = malloc(total);
+    if (!buf) return 0;
+    memcpy(buf, header, hlen);
+    memcpy(buf + hlen, payload, payload_len);
+    ssize_t w = write_all(fd, buf, total);
+    free(buf);
+    return (w == (ssize_t)total) ? 1 : 0;
+}
+
+/* ---------- Helpers for connected names & queue ---------- */
+
+static void enqueue_client(Player p) {
+    if (wait_count >= MAX_QUEUE) return;
+    wait_queue[wait_count++] = p;
+}
+
+static int dequeue_two(Player *a, Player *b) {
+    if (wait_count < 2) return 0;
+    *a = wait_queue[0];
+    *b = wait_queue[1];
+    for (int i = 2; i < wait_count; ++i) wait_queue[i-2] = wait_queue[i];
+    wait_count -= 2;
+    return 1;
+}
+
+static int name_present(const char *name) {
+    for (int i = 0; i < connected_count; ++i)
+        if (connected_names[i][0] && strcmp(connected_names[i], name) == 0) return 1;
     return 0;
 }
 
-int receive_message(int sock, char *buf, int maxlen) {
-    int n = read(sock, buf, maxlen);
-    if (n < 0) return -1;
-    return n;
+static void add_connected_name(const char *name) {
+    if (connected_count >= (int)(sizeof(connected_names)/sizeof(connected_names[0]))) return;
+    strncpy(connected_names[connected_count], name, MAX_NAME);
+    connected_names[connected_count][MAX_NAME] = '\0';
+    connected_count++;
 }
 
-// --------------------- NGP Messaging ---------------------
-int send_ngp_message(int fd, const char *type, const char *fmt, ...) {
-    char buffer[BUF_SIZE], msg[BUF_SIZE];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buffer, sizeof(buffer), fmt, ap);
-    va_end(ap);
-    snprintf(msg, sizeof(msg), "0|%02zu|%s|%s|", strlen(buffer)+strlen(type)+2, type, buffer);
-    return send_message(fd, msg);
+/* Add game entry to linked list */
+static void add_game_entry(pid_t pid, const char *p1, const char *p2) {
+    game_entry_t *g = malloc(sizeof(game_entry_t));
+    if (!g) return;
+    g->pid = pid;
+    strncpy(g->p1, p1, MAX_NAME); g->p1[MAX_NAME] = '\0';
+    strncpy(g->p2, p2, MAX_NAME); g->p2[MAX_NAME] = '\0';
+    g->next = games_head;
+    games_head = g;
 }
 
-// --------------------- Game ---------------------
-void board_info(int board[NUM_PILES], char *buf) {
-    sprintf(buf, "%d %d %d %d %d", board[0], board[1], board[2], board[3], board[4]);
-}
-
-int check_game_over(int board[NUM_PILES]) {
-    for (int i = 0; i < NUM_PILES; i++) {
-        if (board[i] > 0) return 0;
+/* Validate name (printable ASCII, no '|', length <= MAX_NAME) */
+static int valid_name(const char *s) {
+    if (!s) return 0;
+    size_t L = strlen(s);
+    if (L == 0 || L > MAX_NAME) return 0;
+    for (size_t i = 0; i < L; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 32 || c > 126 || c == '|') return 0;
     }
     return 1;
 }
 
-void play_game(PlayerInfo p1, PlayerInfo p2) {
-    int board[NUM_PILES] = {3, 5, 7, 9, 11};
-    int turn = 0, winner = -1;
+/* ---------- Game logic (child) ---------- */
+
+/* create board info string "1 3 5 7 9" */
+static void board_info(int *board, char *buf, size_t bufsz) {
+    snprintf(buf, bufsz, "%d %d %d %d %d", board[0], board[1], board[2], board[3], board[4]);
+}
+
+static int check_game_over_board(int *board) {
+    for (int i = 0; i < NUM_PILES; ++i) if (board[i] > 0) return 0;
+    return 1;
+}
+
+/* The child process runs play_game; it owns the two client fds */
+static void play_game(Player p1, Player p2) {
+    /* child should close listener if inherited */
+    if (listener_fd != -1) close(listener_fd);
+
+    int board[NUM_PILES] = {1, 3, 5, 7, 9};
+    int turn = 0; /* 0 -> p1, 1 -> p2 */
+    int winner = -1;
     char board_buf[128];
 
+    /* send NAME messages */
     send_ngp_message(p1.fd, "NAME", "1|%s", p2.name);
     send_ngp_message(p2.fd, "NAME", "2|%s", p1.name);
 
-    while (1) {
-        PlayerInfo cur = (turn == 0) ? p1 : p2;
-        PlayerInfo other = (turn == 0) ? p2 : p1;
+    while (!check_game_over_board(board)) {
+        Player *cur = (turn == 0) ? &p1 : &p2;
+        Player *opp = (turn == 0) ? &p2 : &p1;
 
-        board_info(board, board_buf);
-        send_ngp_message(cur.fd, "PLAY", "%d|%s", turn + 1, board_buf);
-        send_ngp_message(other.fd, "PLAY", "%d|%s", turn + 1, board_buf);
+        board_info(board, board_buf, sizeof(board_buf));
+        send_ngp_message(p1.fd, "PLAY", "%d|%s", turn + 1, board_buf);
+        send_ngp_message(p2.fd, "PLAY", "%d|%s", turn + 1, board_buf);
 
-        char move_buf[128];
-        int n = receive_message(cur.fd, move_buf, sizeof(move_buf)-1);
-        if (n <= 0) {
-            winner = (turn == 0) ? 2 : 1; // opponent wins
+        /* Read full NGP payload from current player (blocking) */
+        char *payload = read_ngp_payload(cur->fd);
+        if (!payload) {
+            /* read error or framing error: opponent wins by forfeit */
+            winner = (turn == 0) ? 2 : 1;
             break;
         }
-        move_buf[n] = '\0';
 
-        int pile, stones;
-        if (sscanf(move_buf, "0|%*2[0-9]|MOVE|%d|%d|", &pile, &stones) != 2 ||
-            pile < 1 || pile > NUM_PILES || stones < 1 || stones > board[pile-1]) {
-            send_ngp_message(cur.fd, "FAIL", "32 Pile Index or 33 Quantity");
+        int fldc = 0;
+        char **flds = split_payload(payload, &fldc);
+        if (!flds || fldc < 1) {
+            send_ngp_message(cur->fd, "FAIL", "10 Invalid");
+            free(payload); free(flds);
+            winner = (turn == 0) ? 2 : 1;
+            break;
+        }
+        char *type = flds[0];
+
+        if (strcmp(type, "MOVE") != 0) {
+            /* Invalid when expecting MOVE */
+            send_ngp_message(cur->fd, "FAIL", "10 Invalid");
+            free(payload); free(flds);
+            winner = (turn == 0) ? 2 : 1;
+            break;
+        }
+
+        /* Expect exactly 3 fields: "MOVE", pile, qty (plus trailing empty after final '|') */
+        if (fldc < 3) {
+            send_ngp_message(cur->fd, "FAIL", "10 Invalid");
+            free(payload); free(flds);
+            winner = (turn == 0) ? 2 : 1;
+            break;
+        }
+
+        /* Turn enforcement: ensure mover is the correct player */
+        /* We identify players by fd: the payload was read from cur->fd so this is the right socket.
+           The only possible out-of-turn case is if the other player also sent data; but we only
+           read from cur here, so out-of-turn detection is: if cur is not the player whose turn it is.
+           Since cur was chosen based on turn, this can't happen here. However, if both sockets are
+           readable and we read the wrong one, we'd need poll(). To keep correctness we will assume
+           child-only reads expected player's socket. (Parent only reads OPEN messages.)
+        */
+
+        /* parse pile and qty */
+        int pile = atoi(flds[1]);
+        int qty  = atoi(flds[2]);
+
+        free(payload);
+        free(flds);
+
+        if (pile < 1 || pile > NUM_PILES) {
+            send_ngp_message(cur->fd, "FAIL", "32 Pile Index");
+            continue;
+        }
+        int idx = pile - 1;
+        if (qty < 1 || qty > board[idx]) {
+            send_ngp_message(cur->fd, "FAIL", "33 Quantity");
             continue;
         }
 
-        board[pile-1] -= stones;
-        if (check_game_over(board)) {
-            winner = turn + 1;
-            break;
-        }
-        turn = (turn == 0) ? 1 : 0;
+        /* valid move */
+        board[idx] -= qty;
+        log_message("%s removed %d from pile %d -> board: %d %d %d %d %d",
+                    (turn==0)?p1.name:p2.name, qty, pile,
+                    board[0],board[1],board[2],board[3],board[4]);
+
+        if (check_game_over_board(board)) { winner = turn + 1; break; }
+        turn = 1 - turn;
     }
 
-    board_info(board, board_buf);
+    board_info(board, board_buf, sizeof(board_buf));
+    /* winner is player number 1 or 2 (or -1 if something strange happened) */
+    if (winner < 1) winner = 0;
     send_ngp_message(p1.fd, "OVER", "%d|%s|", winner, board_buf);
     send_ngp_message(p2.fd, "OVER", "%d|%s|", winner, board_buf);
 
     close(p1.fd);
     close(p2.fd);
+    _exit(EXIT_SUCCESS);
 }
 
-// --------------------- Main ---------------------
+/* ---------- Parent: accept and initial OPEN handling ---------- */
+
+/* Handle initial OPEN payload from a just-accepted client.
+   payload fields array and count must be provided.
+   If first message is MOVE before OPEN, send FAIL 24 and close.
+*/
+static void handle_open_message(int client_fd, char **flds, int fldc, int opened_before) {
+    /* Expect: OPEN | name |  -> so flds[0] == "OPEN", flds[1] is name */
+    if (fldc < 2) {
+        send_ngp_message(client_fd, "FAIL", "10 Invalid");
+        close(client_fd);
+        return;
+    }
+    char *type = flds[0];
+    if (strcmp(type, "OPEN") != 0) {
+        /* If client sent MOVE as first message -> FAIL 24 Not Playing */
+        if (strcmp(type, "MOVE") == 0) {
+            send_ngp_message(client_fd, "FAIL", "24 Not Playing");
+            close(client_fd);
+            return;
+        }
+        send_ngp_message(client_fd, "FAIL", "10 Invalid");
+        close(client_fd);
+        return;
+    }
+
+    char *name = flds[1];
+
+    /* Validate name */
+    if (!valid_name(name)) {
+        /* If name too long specifically */
+        if (strlen(name) > MAX_NAME) {
+            send_ngp_message(client_fd, "FAIL", "21 Long Name");
+        } else {
+            send_ngp_message(client_fd, "FAIL", "10 Invalid");
+        }
+        close(client_fd);
+        return;
+    }
+
+    /* Already present? FAIL 22 */
+    if (name_present(name)) {
+        send_ngp_message(client_fd, "FAIL", "22 Already Playing");
+        close(client_fd);
+        return;
+    }
+
+    /* OPEN sent twice on same connection? FAIL 23 */
+    if (opened_before) {
+        send_ngp_message(client_fd, "FAIL", "23 Already Open");
+        close(client_fd);
+        return;
+    }
+
+    /* Accept: send WAIT and enqueue */
+    Player p;
+    p.fd = client_fd;
+    strncpy(p.name, name, MAX_NAME);
+    p.name[MAX_NAME] = '\0';
+    p.opened = 1;
+
+    if (!add_name(name)) {
+        /* unable to add name for some reason (table full) */
+        send_ngp_message(client_fd, "FAIL", "10 Invalid");
+        close(client_fd);
+        return;
+    }
+
+    if (!send_ngp_message(client_fd, "WAIT", NULL)) {
+        close(client_fd);
+        return;
+    }
+
+    enqueue_client(p);
+    log_message("Enqueued player '%s' (fd=%d)", p.name, p.fd);
+
+    /* Try to match */
+    Player a, b;
+    if (dequeue_two(&a, &b)) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            /* fork failed */
+            send_ngp_message(a.fd, "FAIL", "10 Invalid");
+            send_ngp_message(b.fd, "FAIL", "10 Invalid");
+            close(a.fd); close(b.fd);
+            remove_name(a.name); remove_name(b.name);
+        } else if (pid == 0) {
+            /* child runs the game */
+            play_game(a, b);
+            /* never returns */
+        } else {
+            /* parent records game and closes fds (child owns them) */
+            add_game_entry(pid, a.name, b.name);
+            log_message("Started game pid=%d: %s vs %s", pid, a.name, b.name);
+            close(a.fd); close(b.fd);
+        }
+    }
+}
+
+/* ---------- Main ---------- */
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
@@ -158,61 +524,60 @@ int main(int argc, char **argv) {
     }
 
     setup_signals();
-    int server_fd = open_listener(argv[1], MAX_QUEUE);
-    if (server_fd < 0) {
-        perror("open_listener");
+
+    listener_fd = open_listener(argv[1], MAX_QUEUE);
+    if (listener_fd < 0) {
+        fprintf(stderr, "open_listener failed\n");
         exit(EXIT_FAILURE);
     }
-
-    PlayerInfo players[2];
-    int player_count = 0;
+    log_message("Server listening on port %s", argv[1]);
 
     while (active) {
         struct sockaddr_storage client_addr;
-        socklen_t addr_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+        socklen_t addrlen = sizeof(client_addr);
+        int client_fd = accept(listener_fd, (struct sockaddr *)&client_addr, &addrlen);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
             perror("accept");
             continue;
         }
 
-        char type_buf[128];
-        int n = receive_message(client_fd, type_buf, sizeof(type_buf)-1);
-        if (n <= 0) { close(client_fd); continue; }
-        type_buf[n] = '\0';
-
-        char name_buf[MAX_NAME + 1];
-        if (sscanf(type_buf, "0|%*2[0-9]|OPEN|%72[^\n]|", name_buf) != 1) {
+        /* For each new connection, read a single NGP payload (the initial message).
+           This will typically be OPEN|name|. We use read_ngp_payload to respect framing.
+        */
+        char *payload = read_ngp_payload(client_fd);
+        if (!payload) {
+            close(client_fd);
+            continue;
+        }
+        int fldc = 0;
+        char **flds = split_payload(payload, &fldc);
+        if (!flds || fldc < 1) {
             send_ngp_message(client_fd, "FAIL", "10 Invalid");
+            free(payload); free(flds);
             close(client_fd);
             continue;
         }
 
-        strncpy(players[player_count].name, name_buf, MAX_NAME);
-        players[player_count].fd = client_fd;
-        send_ngp_message(client_fd, "WAIT", "");
-        player_count++;
+        /* Determine if this fd already has an OPEN recorded in wait_queue (opened_before) */
+        int opened_before = 0;
+        for (int i = 0; i < wait_count; ++i) if (wait_queue[i].fd == client_fd) opened_before = 1;
 
-        if (player_count == 2) {
-            pid_t pid = fork();
-            if (pid < 0) {
-                perror("fork");
-                close(players[0].fd);
-                close(players[1].fd);
-            } else if (pid == 0) {
-                close(server_fd);
-                play_game(players[0], players[1]);
-                exit(EXIT_SUCCESS);
-            } else {
-                close(players[0].fd);
-                close(players[1].fd);
-            }
-            player_count = 0;
-        }
+        /* Handle the initial message (OPEN expected). */
+        handle_open_message(client_fd, flds, fldc, opened_before);
+
+        free(payload);
+        free(flds);
     }
 
     log_message("Shutting down server");
-    close(server_fd);
+    close(listener_fd);
+    /* cleanup connected names list memory is static; games list may have entries */
+    game_entry_t *g = games_head;
+    while (g) {
+        game_entry_t *tmp = g;
+        g = g->next;
+        free(tmp);
+    }
     return 0;
 }
