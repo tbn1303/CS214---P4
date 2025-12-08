@@ -173,7 +173,7 @@ static int send_ngp_message(int fd, const char *type, const char *fmt, ...)
         return 0;
 
     char msg[300];
-    int hlen = snprintf(msg, sizeof(msg), "0|%02zu|", body_len);
+    int hlen = snprintf(msg, sizeof(msg), "0|%02d|", (int)body_len);  // <- cast to int, fix warning
     memcpy(msg + hlen, body, body_len);
 
     return (write_all(fd, msg, hlen + body_len) == (ssize_t)(hlen + body_len));
