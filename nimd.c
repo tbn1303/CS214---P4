@@ -21,7 +21,7 @@
 
 volatile sig_atomic_t active = 1;
 
-/* Structures for queued players and active games */
+// Structures for queued players and active games
 typedef struct {
     int fd;
     char name[MAX_NAME + 1];
@@ -35,7 +35,7 @@ typedef struct game_entry {
     struct game_entry *next;
 } game_entry_t;
 
-/* Globals */
+// Global variables
 static Player wait_queue[MAX_QUEUE];
 static int wait_count = 0;
 
@@ -45,8 +45,7 @@ static int connected_count = 0;
 static game_entry_t *games_head = NULL;
 static int listener_fd = -1;
 
-/* ---------- Utilities ---------- */
-
+// Logging and signal handling
 void log_message(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -64,7 +63,7 @@ void handle_signal(int sig) {
 static int add_connected_name(const char *name);
 static void remove_connected_name(const char *name);
 
-/* Reap children and remove names from connected list */
+// Reap children and remove names from connected list
 void reap_children(int sig) {
     (void)sig;
     int status;
@@ -107,8 +106,7 @@ void setup_signals(void) {
     signal(SIGPIPE, SIG_IGN);
 }
 
-/* ---------- Low-level IO helpers ---------- */
-
+// Low-level read/write helpers
 static ssize_t read_exact(int fd, void *buf, size_t n) {
     size_t got = 0;
     char *p = (char*)buf;
@@ -142,145 +140,104 @@ static ssize_t write_all(int fd, const void *buf, size_t n) {
     return (ssize_t)sent;
 }
 
-/* ---------- NGP framing helpers ---------- */
-
-static char *read_ngp_payload(int fd) {
-    char header[5];
-    ssize_t r = read_exact(fd, header, 5);
-
-    if (r <= 0) return NULL;
-
-    if (!(header[0] == '0' && header[1] == '|' &&
-          isdigit((unsigned char)header[2]) && isdigit((unsigned char)header[3]) &&
-          header[4] == '|')) {
-
-        const char *fail_payload = "FAIL|10 Invalid|";
-        char hbuf[16];
-        snprintf(hbuf, sizeof(hbuf), "0|%02zu|", strlen(fail_payload));
-        write_all(fd, hbuf, strlen(hbuf));
-        write_all(fd, fail_payload, strlen(fail_payload));
-        return NULL;
-    }
-
-    int payload_len = (header[2]-'0')*10 + (header[3]-'0');
-
-    if (payload_len < 0 || payload_len > MAX_PAYLOAD) {
-        const char *fail_payload = "FAIL|10 Invalid|";
-        char hbuf[16];
-        snprintf(hbuf, sizeof(hbuf), "0|%02zu|", strlen(fail_payload));
-        write_all(fd, hbuf, strlen(hbuf));
-        write_all(fd, fail_payload, strlen(fail_payload));
-        return NULL;
-    }
-
-    char *payload = malloc((size_t)payload_len + 1);
-
-    if (!payload) return NULL;
-
-    if (payload_len == 0) {
-        payload[0] = '\0';
-        return payload;
-    }
-
-    ssize_t rr = read_exact(fd, payload, (size_t)payload_len);
-
-    if (rr <= 0) {
-        free(payload);
-        return NULL;
-    }
-
-    payload[payload_len] = '\0';
-
-    if (payload[payload_len - 1] != '|') {
-        const char *fail_payload = "FAIL|10 Invalid|";
-        char hbuf[16];
-        snprintf(hbuf, sizeof(hbuf), "0|%02zu|", strlen(fail_payload));
-        write_all(fd, hbuf, strlen(hbuf));
-        write_all(fd, fail_payload, strlen(fail_payload));
-        free(payload);
-        return NULL;
-    }
-
-    return payload;
-}
-
-static char **split_payload(char *payload, int *out_count) {
-    if (!payload) {
-        *out_count = 0;
-        return NULL;
-    }
-
+static char **split_fields(char *msg, int *count)
+{
     int pipes = 0;
+    for (char *p = msg; *p; p++)
+        if (*p == '|') pipes++;
 
-    for (char *p = payload; *p; ++p) {
-        if (*p == '|') ++pipes;
-    }
-
-    if (pipes <= 0) {
-        *out_count = 0;
-        return NULL;
-    }
-
-    char **arr = malloc((pipes + 1) * sizeof(char*));
-
-    if (!arr) return NULL;
-
+    char **out = malloc(sizeof(char*) * pipes);
     int idx = 0;
-    char *cur = payload;
+    char *cur = msg;
 
     while (idx < pipes) {
-        arr[idx++] = cur;
         char *bar = strchr(cur, '|');
-        if (!bar) break;
         *bar = '\0';
+        out[idx++] = cur;
         cur = bar + 1;
     }
 
-    if (idx < pipes) arr[idx++] = cur;
-    *out_count = idx;
-
-    return arr;
+    *count = idx;
+    return out;
 }
 
-static int send_ngp_message(int fd, const char *type, const char *format, ...) {
-    char payload[MAX_PAYLOAD + 1];
+// Send NGP message
+static int send_ngp_message(int fd, const char *type, const char *fmt, ...) {
+    if (strlen(type) != 4) return 0;   // must be exactly 4 chars
 
-    if (!format || format[0] == '\0') {
-        int n = snprintf(payload, sizeof(payload), "%s|", type);
-        if (n < 0 || n > MAX_PAYLOAD) return 0;
+    char body[256];
+    size_t body_len = 0;
+
+    // Format body fields (after TYPE|)
+    if (fmt == NULL) {
+        // No extra fields
+        snprintf(body, sizeof(body), "%s|", type);
     } else {
         va_list ap;
-        va_start(ap, format);
-        char fields[MAX_PAYLOAD + 1];
-        int fld_len = vsnprintf(fields, sizeof(fields), format, ap);
+        va_start(ap, fmt);
+        char fields[200];
+        vsnprintf(fields, sizeof(fields), fmt, ap);
         va_end(ap);
 
-        if (fld_len < 0 || fld_len > (int)MAX_PAYLOAD) return 0;
-
-        int n = snprintf(payload, sizeof(payload), "%s|%s|", type, fields);
-        if (n < 0 || n > MAX_PAYLOAD) return 0;
+        snprintf(body, sizeof(body), "%s|%s|", type, fields);
     }
 
-    size_t payload_len = strlen(payload);
+    body_len = strlen(body);
 
-    if (payload_len > (size_t)MAX_PAYLOAD) return 0;
+    if (body_len > 104) return 0;  // protocol limit
 
-    char header[16];
-    int hlen = snprintf(header, sizeof(header), "0|%02zu|", payload_len);
+    // Build header: version|len|
+    char msg[300];
+    int hlen = snprintf(msg, sizeof(msg), "0|%02zu|", body_len);
+
     if (hlen < 0) return 0;
 
-    size_t total = (size_t)hlen + payload_len;
-    char *buf = malloc(total);
+    memcpy(msg + hlen, body, body_len);
+    size_t total = hlen + body_len;
 
-    if (!buf) return 0;
+    return (write_all(fd, msg, total) == (ssize_t)total);
+}
 
-    memcpy(buf, header, (size_t)hlen);
-    memcpy(buf + hlen, payload, payload_len);
+// Read NGP payload
+static char *read_ngp_message(int fd)
+{
+    char hdr[5];   // "0|XY|" = 5 bytes
+    if (read_exact(fd, hdr, 5) != 5)
+        return NULL;
 
-    ssize_t w = write_all(fd, buf, total);
-    free(buf);
+    if (hdr[0] != '0' || hdr[1] != '|' ||
+        !isdigit(hdr[2]) || !isdigit(hdr[3]) ||
+        hdr[4] != '|') {
 
-    return (w == (ssize_t)total) ? 1 : 0;
+        send_ngp_message(fd, "FAIL", "10 Invalid");
+        return NULL;
+    }
+
+    int len = (hdr[2]-'0')*10 + (hdr[3]-'0');
+    if (len < 4 || len > 104) { // must contain TYPE|
+        send_ngp_message(fd, "FAIL", "10 Invalid");
+        return NULL;
+    }
+
+    char *buf = malloc(len + 1);
+    if (!buf) return NULL;
+
+    if (read_exact(fd, buf, len) != len) {
+        free(buf);
+        send_ngp_message(fd, "FAIL", "10 Invalid");
+        return NULL;
+    }
+
+    buf[len] = '\0';
+
+    // must end with |
+    if (buf[len-1] != '|') {
+        send_ngp_message(fd, "FAIL", "10 Invalid");
+        free(buf);
+        return NULL;
+    }
+
+    return buf;
 }
 
 /* ---------- Helpers for connected names & queue ---------- */
@@ -373,191 +330,117 @@ static int check_game_over_board(int *board) {
 }
 
 static void play_game(Player p1, Player p2) {
-    if (listener_fd != -1) close(listener_fd);
+    if (listener_fd != -1)
+        close(listener_fd); // child does not listen
 
-    int board[NUM_PILES] = {1, 3, 5, 7, 9};
-    int turn = 0;
-    int winner = -1;
-    char board_buf[128];
+    int board[5] = {1,3,5,7,9};
+    int turn = 1;
+    int winner = 0;
+    char buf[64];
 
     send_ngp_message(p1.fd, "NAME", "1|%s", p2.name);
     send_ngp_message(p2.fd, "NAME", "2|%s", p1.name);
 
-    while (!check_game_over_board(board)) {
-        Player *cur = (turn == 0) ? &p1 : &p2;
+    for (;;) {
+        // send board
+        snprintf(buf, sizeof(buf), "%d %d %d %d %d",
+                 board[0],board[1],board[2],board[3],board[4]);
 
-        board_info(board, board_buf, sizeof(board_buf));
-        send_ngp_message(p1.fd, "PLAY", "%d|%s", turn + 1, board_buf);
-        send_ngp_message(p2.fd, "PLAY", "%d|%s", turn + 1, board_buf);
+        send_ngp_message(p1.fd, "PLAY", "%d|%s", turn, buf);
+        send_ngp_message(p2.fd, "PLAY", "%d|%s", turn, buf);
 
-        char *payload = read_ngp_payload(cur->fd);
-        if (!payload) {
-            winner = (turn == 0) ? 2 : 1;
-            break;
-        }
+        Player *cur = (turn == 1 ? &p1 : &p2);
 
-        int fldc = 0;
-        char **flds = split_payload(payload, &fldc);
-        if (!flds || fldc < 1) {
+        char *msg = read_ngp_message(cur->fd);
+        if (!msg) { winner = (turn == 1 ? 2 : 1); break; }
+
+        int fc; char **fld = split_fields(msg, &fc);
+        if (fc < 3 || strcmp(fld[0], "MOVE") != 0) {
             send_ngp_message(cur->fd, "FAIL", "10 Invalid");
-            free(payload);
-            free(flds);
-            winner = (turn == 0) ? 2 : 1;
+            winner = (turn == 1 ? 2 : 1);
+            free(msg); free(fld);
             break;
         }
 
-        char *type = flds[0];
+        int pile = atoi(fld[1]);
+        int qty  = atoi(fld[2]);
 
-        if (strcmp(type, "MOVE") != 0) {
-            send_ngp_message(cur->fd, "FAIL", "10 Invalid");
-            free(payload);
-            free(flds);
-            winner = (turn == 0) ? 2 : 1;
-            break;
-        }
+        free(msg); free(fld);
 
-        if (fldc < 3) {
-            send_ngp_message(cur->fd, "FAIL", "10 Invalid");
-            free(payload);
-            free(flds);
-            winner = (turn == 0) ? 2 : 1;
-            break;
-        }
-
-        int pile = atoi(flds[1]);
-        int qty  = atoi(flds[2]);
-
-        free(payload);
-        free(flds);
-
-        if (pile < 1 || pile > NUM_PILES) {
+        if (pile < 1 || pile > 5) {
             send_ngp_message(cur->fd, "FAIL", "32 Pile Index");
             continue;
         }
 
-        int idx = pile - 1;
-
-        if (qty < 1 || qty > board[idx]) {
+        if (qty < 1 || qty > board[pile-1]) {
             send_ngp_message(cur->fd, "FAIL", "33 Quantity");
             continue;
         }
 
-        board[idx] -= qty;
+        board[pile-1] -= qty;
 
-        log_message("%s removed %d from pile %d -> board: %d %d %d %d %d",
-                    (turn == 0) ? p1.name : p2.name,
-                    qty,
-                    pile,
-                    board[0], board[1], board[2], board[3], board[4]);
+        int empty = 1;
+        for (int i=0;i<5;i++) if (board[i]>0) empty=0;
+        if (empty) { winner = turn; break; }
 
-        if (check_game_over_board(board)) {
-            winner = turn + 1;
-            break;
-        }
-
-        turn = 1 - turn;
+        turn = (turn == 1 ? 2 : 1);
     }
 
-    board_info(board, board_buf, sizeof(board_buf));
-    if (winner < 1) winner = 0;
+    snprintf(buf, sizeof(buf), "%d %d %d %d %d",
+             board[0],board[1],board[2],board[3],board[4]);
 
-    send_ngp_message(p1.fd, "OVER", "%d|%s", winner, board_buf);
-    send_ngp_message(p2.fd, "OVER", "%d|%s", winner, board_buf);
+    send_ngp_message(p1.fd, "OVER", "%d|%s|", winner, buf);
+    send_ngp_message(p2.fd, "OVER", "%d|%s|", winner, buf);
 
     close(p1.fd);
     close(p2.fd);
-    _exit(EXIT_SUCCESS);
+    _exit(0);
 }
 
-/* ---------- Parent: initial OPEN handling ---------- */
-
-static void handle_open_message(int client_fd, char **flds, int fldc, int opened_before) {
-    if (fldc < 2) {
-        send_ngp_message(client_fd, "FAIL", "10 Invalid");
-        close(client_fd);
+// Handle OPEN message
+static void handle_open(int fd, char **fld, int fc) {
+    if (fc < 2 || strcmp(fld[0], "OPEN") != 0) {
+        send_ngp_message(fd, "FAIL", "10 Invalid");
+        close(fd);
         return;
     }
 
-    char *type = flds[0];
-
-    if (strcmp(type, "OPEN") != 0) {
-        if (strcmp(type, "MOVE") == 0) {
-            send_ngp_message(client_fd, "FAIL", "24 Not Playing");
-            close(client_fd);
-            return;
-        }
-        send_ngp_message(client_fd, "FAIL", "10 Invalid");
-        close(client_fd);
-        return;
-    }
-
-    char *name = flds[1];
+    char *name = fld[1];
 
     if (!valid_name(name)) {
-        if (strlen(name) > MAX_NAME) {
-            send_ngp_message(client_fd, "FAIL", "21 Long Name");
-        } else {
-            send_ngp_message(client_fd, "FAIL", "10 Invalid");
-        }
-        close(client_fd);
+        send_ngp_message(fd, "FAIL", "21 Long Name");
+        close(fd);
         return;
     }
 
     if (name_present(name)) {
-        send_ngp_message(client_fd, "FAIL", "22 Already Playing");
-        close(client_fd);
-        return;
-    }
-
-    if (opened_before) {
-        send_ngp_message(client_fd, "FAIL", "23 Already Open");
-        close(client_fd);
+        send_ngp_message(fd, "FAIL", "22 Already Playing");
+        close(fd);
         return;
     }
 
     Player p;
-    p.fd = client_fd;
+    p.fd = fd;
     strncpy(p.name, name, MAX_NAME);
-    p.name[MAX_NAME] = '\0';
-    p.opened = 1;
 
-    if (!add_connected_name(name)) {
-        send_ngp_message(client_fd, "FAIL", "10 Invalid");
-        close(client_fd);
-        return;
-    }
-
-    if (!send_ngp_message(client_fd, "WAIT", NULL)) {
-        close(client_fd);
-        remove_connected_name(p.name);
-        return;
-    }
-
+    add_connected_name(name);
+    send_ngp_message(fd, "WAIT", NULL);
     enqueue_client(p);
-    log_message("Enqueued player '%s' (fd=%d)", p.name, p.fd);
 
-    Player a, b;
-    if (dequeue_two(&a, &b)) {
+    if (wait_count >= 2) {
+        Player a, b;
+        dequeue_two(&a, &b);
+
         pid_t pid = fork();
-        if (pid < 0) {
-            send_ngp_message(a.fd, "FAIL", "10 Invalid");
-            send_ngp_message(b.fd, "FAIL", "10 Invalid");
-            close(a.fd);
-            close(b.fd);
-            remove_connected_name(a.name);
-            remove_connected_name(b.name);
-        } else if (pid == 0) {
-            play_game(a, b);
+        if (pid == 0) {
+            play_game(a, b); // CHILD
         } else {
             add_game_entry(pid, a.name, b.name);
-            log_message("Started game pid=%d: %s vs %s", pid, a.name, b.name);
             close(a.fd);
             close(b.fd);
         }
     }
 }
-
-/* ---------- Main ---------- */
 
 int main(int argc, char **argv) {
     if (argc != 2) {
