@@ -38,21 +38,24 @@ Started game pid=.......: Guest1 vs Guest2
 
 Test Error Condition for Invalid:
 
-
+Test programs that cannot read the message or message is not valid (not match the format). 
+When either players send an invalid message, the host will send a message of invalid to both player and close the connection on the player that send invalid message.
 
 -------------------------------------------------------------------------------------------------------------------
 
 
 Test Error Condition for Long Name:
 
-
+Program that test for long name.
+If player send the right message with the right format, however, the name is too long, the connection will be closed and the player with the long name has to reconnect.
 
 -------------------------------------------------------------------------------------------------------------------
 
 
 Test Error for Already Playing:
 
-
+This program will check if the player that try to connect to the server has the same name with the player that already in the server and is playing.
+It will check for that name and close connection if the name already created and close the connection.
 
 -------------------------------------------------------------------------------------------------------------------
 
