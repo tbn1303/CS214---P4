@@ -62,16 +62,13 @@ It will check for that name and close connection if the name already created and
 
 Test Error for Already Open:
 
-
+The program will check for open if it has been sent. If it has been sent then it will send message to the player and close connection.
 
 -------------------------------------------------------------------------------------------------------------------
 
 
 Test Error for Not Playing:
 
-
+If either player send move before they enter their name, a message will be sent to the player and close connection.
 
 -------------------------------------------------------------------------------------------------------------------
-
-
-Test Error for Impatient:
